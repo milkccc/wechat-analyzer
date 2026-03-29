@@ -1,0 +1,24 @@
+# Local config
+config.json
+
+# Generated data / reports
+exports/
+outputs/
+analysis_output/
+qq_c2c_exports/
+qq_analysis_output_*/
+wechat_analysis_output_*/
+export_*.csv
+merged_*.csv
+*.meta.json
+*.clean.db
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# macOS
+.DS_Store

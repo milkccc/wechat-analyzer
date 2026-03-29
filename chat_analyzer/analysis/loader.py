@@ -1,0 +1,192 @@
+"""
+loader.py — 加载和清洗分析输入 CSV。
+
+支持单平台导出 CSV，也支持 merge_analysis_exports.py 生成的合并 CSV。
+"""
+
+import re
+import pandas as pd
+
+# ── 微信表情占位符 → Unicode Emoji ────────────────────────────────────────────
+# 微信 Mac/iOS 客户端把表情存为 [Grin]、[Laugh] 等英文名称文本，在此统一转换。
+_WECHAT_EMOJI: dict[str, str] = {
+    # ── 笑 ──────────────────────────────────────────────────────────────────
+    'Smile':        '😊',  'Grin':         '😁',  'Laugh':        '😂',
+    'Joy':          '😄',  'Chuckle':      '😄',  'Lol':          '🤣',
+    'Blush':        '☺️',  'Smirk':        '😏',  'Wink':         '😉',
+    'Tongue':       '😛',  'Cool':         '😎',  'Angel':        '😇',
+    'Hehe':         '😄',  'Toothy':       '😁',  'Naughty':      '😝',
+    # ── 哭/难过 ────────────────────────────────────────────────────────────
+    'Cry':          '😢',  'Sob':          '😭',  'Weep':         '😢',
+    'Whimper':      '😥',  'Wronged':      '🥺',  'Pout':         '😔',
+    'Frown':        '🙁',  'Sad':          '😞',
+    # ── 惊讶/疑惑 ──────────────────────────────────────────────────────────
+    'Surprised':    '😯',  'Shock':        '😱',  'Wow':          '😲',
+    'Confused':     '😕',  'Question':     '🤔',  'Think':        '🤔',
+    'Speechless':   '😶',  'Awkward':      '😅',  'Sweat':        '😅',
+    # ── 愤怒/厌恶 ──────────────────────────────────────────────────────────
+    'Scowl':        '😡',  'Angry':        '😠',  'Rage':         '🤬',
+    'Grimace':      '😬',  'Disdain':      '😒',  'Bored':        '😒',
+    # ── 困/累/无语 ─────────────────────────────────────────────────────────
+    'Sleep':        '😴',  'Drowsy':       '😪',  'Sleepy':       '😪',
+    'Yawn':         '🥱',  'Dead':         '💀',  'Skull':        '💀',
+    'Zombie':       '🧟',
+    # ── 害羞/尴尬 ──────────────────────────────────────────────────────────
+    'Shy':          '🙈',  'Embarrassed':  '😳',  'Sneaky':       '🤭',
+    'Insidious':    '😏',  'Trick':        '😜',
+    # ── 手势/动作 ──────────────────────────────────────────────────────────
+    'Clap':         '👏',  'Wave':         '👋',  'Pray':         '🙏',
+    'ThumbsUp':     '👍',  'ThumbsDown':   '👎',  'Ok':           '👌',
+    'Victory':      '✌️',  'Salute':       '🫡',  'Fist':         '✊',
+    'Muscle':       '💪',  'Handshake':    '🤝',  'Hug':          '🤗',
+    'Drool':        '🤤',  'Vomit':        '🤮',  'Sick':         '🤒',
+    # ── 物品/动物 ──────────────────────────────────────────────────────────
+    'Hammer':       '🔨',  'Bomb':         '💣',  'Knife':        '🔪',
+    'Balloon':      '🎈',  'Party':        '🎉',  'Gift':         '🎁',
+    'Flower':       '🌹',  'Heart':        '❤️',  'BrokenHeart':  '💔',
+    'Star':         '⭐',  'Fire':         '🔥',  'Lightning':    '⚡',
+    'Ghost':        '👻',  'Poop':         '💩',  'Alien':        '👾',
+    'Robot':        '🤖',  'Pig':          '🐷',  'Dog':          '🐶',
+    'Cat':          '🐱',  'Monkey':       '🐵',  'Rabbit':       '🐰',
+    # ── 其他常用 ───────────────────────────────────────────────────────────
+    'Kneeling':     '🧎',  'Worship':      '🙇',  'Facepalm':     '🤦',
+    'Shrug':        '🤷',  'Monocle':      '🧐',  'Nerd':         '🤓',
+    'Cowboy':       '🤠',  'Pirate':       '🏴‍☠️', 'Ninja':        '🥷',
+    'Strong':       '💪',  'Run':          '🏃',  'Dance':        '💃',
+    'NoSee':        '🙈',  'NoHear':       '🙉',  'NoSpeak':      '🙊',
+    'Expressive':   '🤪',  'Crazy':        '🤪',  'Starstruck':   '🤩',
+    'Melting':      '🫠',  'Saliva':       '🤤',  'Triumph':      '😤',
+    'Moai':         '🗿',
+}
+# 构建大小写不敏感的替换 pattern
+_EMOJI_RE = re.compile(
+    r'\[(' + '|'.join(re.escape(k) for k in _WECHAT_EMOJI) + r')\]',
+    re.IGNORECASE
+)
+
+
+def _replace_wechat_emoji(text: str) -> str:
+    """把微信表情占位符替换为对应的 Unicode Emoji"""
+    return _EMOJI_RE.sub(
+        lambda m: _WECHAT_EMOJI.get(m.group(1), _WECHAT_EMOJI.get(m.group(1).capitalize(), m.group(0))),
+        text
+    )
+
+# 低信号消息的正则过滤（单字/语气词/纯emoji占位符）
+_NOISE_RE = re.compile(
+    r'^(好|嗯+|哦|哈+|ok|OK|好的|收到|嗯嗯+|好哒|好滴|是的|对|呢|吧|啊|哎|\[.*?\])$',
+    re.IGNORECASE
+)
+_FORWARDED_RE = re.compile(r'^[-─]+\s*转发的聊天记录\s*[-─]+')
+_EMOJI_ONLY_RE = re.compile(
+    r'^[\U0001F300-\U0001FFFF\U00002600-\U000027BF\s]+$'
+)
+# 非对话内容：XML/小程序、链接、百度网盘/京东等分享、结构化文档
+_XML_RE      = re.compile(r'^\s*<')                          # XML / 小程序卡片
+_URL_RE      = re.compile(r'https?://')                      # 含链接
+_MULTILINE_RE = re.compile(r'\n.*\n')                        # 含两个以上换行（结构化文档）
+_SHARE_RE    = re.compile(                                    # 常见分享前缀
+    r'^(【|通过网盘分享|【京东】|【淘宝】|【拼多多】'
+    r'|【Tencent Docs】|链接:|提取码:)'
+)
+
+# WeChatMsg 不同版本可能有不同列名，做统一映射
+_COL_MAP = {
+    'StrContent': 'content',  'strContent': 'content',
+    'IsSender':   'is_sender','isSender':   'is_sender',
+    'CreateTime': 'ts',       'createTime': 'ts',
+    'timestamp':  'ts',
+    'Type':       'msg_type', 'type':       'msg_type',
+    'StrTalker':  'talker',   'strTalker':  'talker',
+    'sender':     'sender',
+    'datetime':   'datetime',
+    'source_name': 'source_name',
+    'source_platform': 'source_platform',
+}
+
+
+def load_full(csv_path: str, text_only: bool = True) -> pd.DataFrame:
+    """
+    加载 CSV，标准化列名，解析时间。
+    默认只保留文本消息，返回完整双人会话 DataFrame。
+    """
+    df = pd.read_csv(csv_path)
+    df = df.rename(columns=_COL_MAP)
+
+    for col in ('content', 'is_sender'):
+        if col not in df.columns:
+            raise ValueError(
+                f"CSV 中缺少列 '{col}'，请确认使用 WeChatMsg 导出格式。\n"
+                f"当前列名：{list(df.columns)}"
+            )
+
+    if 'ts' not in df.columns:
+        if 'datetime' not in df.columns:
+            raise ValueError(
+                "CSV 中缺少时间列 'ts' 或 'datetime'，无法进行分析。"
+            )
+        dt = pd.to_datetime(df['datetime'], errors='coerce')
+        df['ts'] = (dt.astype('int64') // 10**9)
+
+    if 'msg_type' not in df.columns:
+        df['msg_type'] = 1
+    if text_only:
+        df = df[df['msg_type'] == 1]
+
+    df['content'] = df['content'].fillna('').astype(str)
+    df['content'] = df['content'].apply(_replace_wechat_emoji)
+    df = df[df['content'].str.len() > 0]
+
+    df['datetime'] = pd.to_datetime(df['ts'], unit='s', errors='coerce')
+    df = df.dropna(subset=['datetime'])
+
+    if 'sender' not in df.columns:
+        df['sender'] = df['is_sender'].map({1: '我', 0: '对方'}).fillna('未知')
+    if 'source_name' not in df.columns:
+        df['source_name'] = ''
+    if 'source_platform' not in df.columns:
+        df['source_platform'] = 'unknown'
+
+    df['date']    = df['datetime'].dt.date
+    df['hour']    = df['datetime'].dt.hour
+    df['month']   = df['datetime'].dt.to_period('M')
+    df['weekday'] = df['datetime'].dt.dayofweek  # 0=周一
+
+    return df.sort_values('datetime').reset_index(drop=True)
+
+
+def load(csv_path: str, sender: int = 1) -> pd.DataFrame:
+    """
+    返回指定发送方的文本消息 DataFrame。
+    sender=1 为自己，sender=0 为对方。
+    """
+    df = load_full(csv_path, text_only=True)
+    return df[df['is_sender'] == sender].copy().reset_index(drop=True)
+
+
+def filter_for_personality(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    去除低信号消息，保留有人格分析价值的内容。
+    规则：
+      - 长度 12-150 字符（过短无信息量，过长通常是转发文档）
+      - 非纯噪音（语气词、"好的"等）
+      - 非转发聊天记录
+      - 非纯 emoji
+      - 非 XML / 小程序卡片
+      - 不含 URL（链接分享）
+      - 非结构化多行文档（含两个以上换行）
+      - 非常见分享前缀（网盘/电商/文档链接）
+    """
+    c = df['content']
+    mask = (
+        (c.str.len() >= 12) &
+        (c.str.len() <= 150) &
+        (~c.str.strip().apply(lambda x: bool(_NOISE_RE.fullmatch(x)))) &
+        (~c.apply(lambda x: bool(_FORWARDED_RE.match(x)))) &
+        (~c.apply(lambda x: bool(_EMOJI_ONLY_RE.match(x)))) &
+        (~c.apply(lambda x: bool(_XML_RE.match(x)))) &
+        (~c.apply(lambda x: bool(_URL_RE.search(x)))) &
+        (~c.apply(lambda x: bool(_MULTILINE_RE.search(x)))) &
+        (~c.apply(lambda x: bool(_SHARE_RE.match(x))))
+    )
+    return df[mask].reset_index(drop=True)
